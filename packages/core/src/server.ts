@@ -11,6 +11,21 @@ import { generatedTools } from "./tools.js";
 import { Schema, Validator } from "@cfworker/json-schema";
 import { openapiSchemaToJsonSchema } from "@openapi-contrib/openapi-schema-to-json-schema";
 import { DEFAULT_PRESET_TAGS } from "./presets.js";
+import { formatJsonResponse, withCompactParameters } from "./compact.js";
+import {
+  batchUpdateTransactionsToolDefinition,
+  executeBatchUpdateTransactions,
+} from "./batch-transactions.js";
+
+const supportsCompactParameters = (def: McpToolDefinition): boolean =>
+  def.method.toLowerCase() === 'get' &&
+  !def.name.startsWith('download_') &&
+  !def.name.startsWith('export_');
+
+const allTools: McpToolDefinition[] = [
+  ...generatedTools,
+  batchUpdateTransactionsToolDefinition,
+];
 
 const createErrorResult = (payload: Record<string, unknown>): CallToolResult => ({
   isError: true,
@@ -72,9 +87,13 @@ export const executeApiTool = async (
   serverConfig: McpServerConfig,
 ): Promise<CallToolResult> => {
   let validatedArgs: CallToolRequestArguments;
+  const effectiveInputSchema = supportsCompactParameters(definition)
+    ? withCompactParameters(definition.inputSchema)
+    : definition.inputSchema;
+
   try {
     // Validate arguments against the input schema
-    const schema = openapiSchemaToJsonSchema(definition.inputSchema);
+    const schema = openapiSchemaToJsonSchema(effectiveInputSchema);
     const validator = new Validator(schema as Schema, '4')
     const argsToParse = (typeof toolArgs === 'object' && toolArgs !== null) ? toolArgs : {};
     const validatedResult = validator.validate(argsToParse);
@@ -93,6 +112,13 @@ export const executeApiTool = async (
       error: error instanceof Error ? error.message : error,
     });
   }
+
+  const useCompact =
+    validatedArgs['compact'] === true ||
+    (validatedArgs['compact'] !== false && Boolean(serverConfig.compactResponses));
+  const fields = Array.isArray(validatedArgs['fields'])
+    ? validatedArgs['fields'].filter((f): f is string => typeof f === 'string')
+    : undefined;
 
   // Prepare URL, query parameters, headers, and request body
   let urlPath = definition.pathTemplate;
@@ -216,7 +242,8 @@ export const executeApiTool = async (
       const responseData = JSON.parse(responseText);
       return {
         content: [{
-          type: 'text', text: JSON.stringify(responseData, null, 2)
+          type: 'text',
+          text: formatJsonResponse(responseData, { compact: useCompact, fields }),
         }]
       };
     } catch (error: unknown) {
@@ -358,18 +385,28 @@ export const getServer = (serverConfig: McpServerConfig): Server => {
   const enableToolTags = serverConfig.enableToolTags ?? DEFAULT_PRESET_TAGS;
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    const toolsForClient: Tool[] = generatedTools.filter(def => enableToolTags.length === 0 || enableToolTags.some(tag => def.tags.includes(tag))).map(def => ({
-      name: def.name,
-      description: def.description,
-      inputSchema: {
-        ...sanitizeInputSchema(def.inputSchema),
-        type: 'object',
-      },
-    }));
+    const toolsForClient: Tool[] = allTools
+      .filter(def => enableToolTags.length === 0 || enableToolTags.some(tag => def.tags.includes(tag)))
+      .map(def => {
+        const schema = supportsCompactParameters(def)
+          ? withCompactParameters(def.inputSchema)
+          : def.inputSchema;
+        return {
+          name: def.name,
+          description: def.description,
+          inputSchema: {
+            ...sanitizeInputSchema(schema),
+            type: 'object',
+          },
+        };
+      });
     return { tools: toolsForClient };
   });
   server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest): Promise<CallToolResult> => {
     const { name: toolName, arguments: toolArgs } = request.params;
+    if (toolName === batchUpdateTransactionsToolDefinition.name) {
+      return await executeBatchUpdateTransactions(toolArgs ?? {}, serverConfig);
+    }
     const toolDefinition = generatedTools.find(tool => tool.name === toolName);
     if (!toolDefinition) {
       console.error(`Error: Unknown tool requested: ${toolName}`);
